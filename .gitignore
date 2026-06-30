@@ -1,0 +1,26 @@
+# Gradle
+.gradle/
+build/
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android Studio
+.idea/
+*.iml
+
+# Local machine state
+local.properties
+.DS_Store
+Thumbs.db
+
+# Generated captures and reports
+captures/
+*.hprof
+
+# Signing material
+*.jks
+*.keystore
+*.p12
+
+# Logs
+*.log
