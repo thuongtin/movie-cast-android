@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Build APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build and test
+        run: ./gradlew testDebugUnitTest assembleDebug
+
+      - name: Prepare release assets
+        run: |
+          version="${GITHUB_REF_NAME:-manual}"
+          cp app/build/outputs/apk/debug/app-debug.apk "MovieCastAndroid-${version}-debug.apk"
+          sha256sum "MovieCastAndroid-${version}-debug.apk" > SHA256SUMS.txt
+
+      - name: Write release notes
+        run: |
+          cat > RELEASE_NOTES.md <<'EOF'
+          Movie Cast Android release.
+
+          Asset:
+          - Debug APK for direct sideload testing
+
+          Main capabilities:
+          - Browse movie pages in app
+          - Detect direct video URLs
+          - Cast media to Chromecast without screen mirroring
+          - Preview detected links in app
+          - Control TV playback, seek, volume, mute, stop, and disconnect
+          - Detect and cast detached subtitles when the TV can fetch them
+
+          This APK is intended for direct testing outside the Play Store.
+          EOF
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            MovieCastAndroid-*-debug.apk
+            SHA256SUMS.txt
