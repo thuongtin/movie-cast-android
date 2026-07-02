@@ -75,6 +75,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DividerDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -170,6 +171,11 @@ private val CastUiState.hasActiveMedia: Boolean
             playerState == "BUFFERING"
         )
 
+data class ResumePromptState(
+    val candidate: MediaCandidate,
+    val position: PlaybackPositionEntry
+)
+
 data class AppUiState(
     val address: String = DEFAULT_START_URL,
     val pageTitle: String = "",
@@ -183,7 +189,8 @@ data class AppUiState(
     val subtitles: Map<String, SubtitleCandidate> = emptyMap(),
     val selectedSubtitleUrl: String = SUBTITLE_AUTO,
     val history: List<HistoryEntry> = emptyList(),
-    val cast: CastUiState = CastUiState()
+    val cast: CastUiState = CastUiState(),
+    val resumePrompt: ResumePromptState? = null
 )
 
 data class MediaPreviewInfo(
@@ -204,6 +211,9 @@ class MainActivity : FragmentActivity() {
     @Volatile private var appMutedForWebView: Boolean = false
     private val handler = Handler(Looper.getMainLooper())
     private val probedHlsManifests = mutableSetOf<String>()
+    private var lastPlaybackPersistAtMs = 0L
+    private var lastPlaybackPersistPositionMs = 0L
+    private var lastPlaybackPersistUrl = ""
     private var uiState by mutableStateOf(AppUiState())
 
     private val pollRunnable = object : Runnable {
@@ -241,6 +251,8 @@ class MainActivity : FragmentActivity() {
                     onClearCandidates = { clearCandidates() },
                     onManualCandidate = { addManualCandidate(it) },
                     onCastSelected = { castSelectedCandidate() },
+                    onResumeStartOver = { chooseResumePosition(startFromSaved = false) },
+                    onResumeContinue = { chooseResumePosition(startFromSaved = true) },
                     onQueueSelected = { queueSelectedCandidate() },
                     onPlayPause = { togglePlayback() },
                     onStop = { stopPlayback() },
@@ -745,33 +757,70 @@ class MainActivity : FragmentActivity() {
             return
         }
         Log.d(LOG_TAG, "castSelectedCandidate sending to device=${session.castDevice?.friendlyName}")
+        val savedPosition = historyStore.playbackPositionFor(candidate.url)
+        if (savedPosition != null) {
+            uiState = uiState.copy(
+                resumePrompt = ResumePromptState(candidate, savedPosition),
+                status = "Link này có vị trí xem đã lưu."
+            )
+            return
+        }
+        startCastCandidate(candidate, startPositionMs = 0L)
+    }
+
+    private fun chooseResumePosition(startFromSaved: Boolean) {
+        val prompt = uiState.resumePrompt ?: return
+        val startPositionMs = if (startFromSaved) {
+            PlaybackResumePolicy.startPosition(prompt.position.positionMs, prompt.position.durationMs)
+        } else {
+            0L
+        }
+        uiState = uiState.copy(resumePrompt = null)
+        startCastCandidate(prompt.candidate, startPositionMs)
+    }
+
+    private fun startCastCandidate(candidate: MediaCandidate, startPositionMs: Long) {
+        val session = currentCastSession()
+        if (session == null) {
+            Log.d(LOG_TAG, "startCastCandidate blocked: no connected Cast session")
+            uiState = uiState.copy(status = "Hãy chọn TV bằng nút Cast trước.")
+            return
+        }
+        Log.d(LOG_TAG, "startCastCandidate sending to device=${session.castDevice?.friendlyName} startPositionMs=$startPositionMs")
         prepareSubtitleForCast { preparedSubtitle ->
-            loadCandidateOnCast(candidate, preparedSubtitle)
+            loadCandidateOnCast(candidate, preparedSubtitle, startPositionMs)
         }
     }
 
-    private fun loadCandidateOnCast(candidate: MediaCandidate, preparedSubtitle: PreparedSubtitle?) {
+    private fun loadCandidateOnCast(
+        candidate: MediaCandidate,
+        preparedSubtitle: PreparedSubtitle?,
+        startPositionMs: Long
+    ) {
         val session = currentCastSession() ?: run {
             uiState = uiState.copy(status = "Phiên Cast đã ngắt trước khi gửi media.")
             return
         }
+        val safeStartPositionMs = startPositionMs.coerceAtLeast(0L)
         val mediaInfo = candidate.toMediaInfo(preparedSubtitle)
         val request = MediaLoadRequestData.Builder()
             .setMediaInfo(mediaInfo)
             .setAutoplay(true)
+            .setCurrentTime(safeStartPositionMs)
             .apply {
                 if (preparedSubtitle != null) {
                     setActiveTrackIds(longArrayOf(preparedSubtitle.trackId))
                 }
             }
             .build()
-        uiState = uiState.copy(status = if (preparedSubtitle != null) "Đang gửi video và phụ đề lên TV." else "Đang gửi video lên TV.")
+        val resumeSuffix = if (safeStartPositionMs > 0L) " từ ${formatMillis(safeStartPositionMs)}" else ""
+        uiState = uiState.copy(status = if (preparedSubtitle != null) "Đang gửi video và phụ đề lên TV$resumeSuffix." else "Đang gửi video lên TV$resumeSuffix.")
         session.remoteMediaClient?.load(request)?.setResultCallback { result ->
             runOnUiThread {
                 Log.d(LOG_TAG, "castSelectedCandidate load result success=${result.status.isSuccess} status=${result.status.statusCode} message=${result.status.statusMessage}")
                 uiState = uiState.copy(
                     status = if (result.status.isSuccess) {
-                        if (preparedSubtitle != null) "Đã cast video kèm phụ đề lên TV." else "Đã cast video lên TV."
+                        if (preparedSubtitle != null) "Đã cast video kèm phụ đề lên TV$resumeSuffix." else "Đã cast video lên TV$resumeSuffix."
                     } else {
                         "TV từ chối media này."
                     }
@@ -840,18 +889,32 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun stopPlayback() {
+        rememberCurrentPlaybackPosition()
         currentCastSession()?.remoteMediaClient?.stop()
         refreshCastState("Đã dừng phát trên TV.")
     }
 
     private fun disconnectCast() {
+        rememberCurrentPlaybackPosition()
         castContext?.sessionManager?.endCurrentSession(true)
         uiState = uiState.copy(
             cast = CastUiState(
                 available = uiState.cast.available,
                 message = "Đã ngắt kết nối TV."
             ),
+            resumePrompt = null,
             status = "Đã ngắt kết nối TV."
+        )
+    }
+
+    private fun rememberCurrentPlaybackPosition() {
+        val client = currentCastSession()?.remoteMediaClient ?: return
+        rememberPlaybackPositionFromTv(
+            url = client.mediaInfo?.contentId.orEmpty(),
+            title = client.mediaInfo?.metadata?.getString(MediaMetadata.KEY_TITLE).orEmpty(),
+            positionMs = client.approximateStreamPosition,
+            durationMs = client.streamDuration,
+            force = true
         )
     }
 
@@ -882,6 +945,8 @@ class MainActivity : FragmentActivity() {
     private fun refreshCastState(message: String? = null) {
         val session = currentCastSession()
         val client = session?.remoteMediaClient
+        val positionMs = client?.approximateStreamPosition ?: 0L
+        val durationMs = client?.streamDuration ?: 0L
         val playerState = when (client?.playerState) {
             MediaStatus.PLAYER_STATE_PLAYING -> "PLAYING"
             MediaStatus.PLAYER_STATE_PAUSED -> "PAUSED"
@@ -902,14 +967,48 @@ class MainActivity : FragmentActivity() {
             connected = session != null,
             deviceName = session?.castDevice?.friendlyName ?: "Chưa chọn TV",
             playerState = if (session == null) "IDLE" else playerState,
-            positionMs = client?.approximateStreamPosition ?: 0L,
-            durationMs = client?.streamDuration ?: 0L,
+            positionMs = positionMs,
+            durationMs = durationMs,
             volume = session?.volume?.toFloat() ?: uiState.cast.volume,
             muted = session?.isMute ?: uiState.cast.muted,
             activeTitle = metadataTitle,
             message = message ?: idleMessage ?: if (session != null) "Đang kết nối ${session.castDevice?.friendlyName ?: "TV"}." else "Chọn TV bằng nút Cast."
         )
-        uiState = uiState.copy(cast = cast)
+        rememberPlaybackPositionFromTv(
+            url = client?.mediaInfo?.contentId.orEmpty(),
+            title = metadataTitle,
+            positionMs = positionMs,
+            durationMs = durationMs
+        )
+        uiState = uiState.copy(
+            cast = cast,
+            resumePrompt = if (session == null) null else uiState.resumePrompt
+        )
+    }
+
+    private fun rememberPlaybackPositionFromTv(
+        url: String,
+        title: String,
+        positionMs: Long,
+        durationMs: Long,
+        force: Boolean = false
+    ) {
+        if (!PlaybackResumePolicy.isResumable(positionMs, durationMs)) return
+        val now = System.currentTimeMillis()
+        val positionDelta = kotlin.math.abs(positionMs - lastPlaybackPersistPositionMs)
+        val sameMedia = url == lastPlaybackPersistUrl
+        if (!force && sameMedia && now - lastPlaybackPersistAtMs < 5_000L && positionDelta < 5_000L) return
+        val stored = historyStore.rememberPlaybackPosition(
+            url = url,
+            title = title,
+            positionMs = positionMs,
+            durationMs = durationMs
+        )
+        if (stored != null) {
+            lastPlaybackPersistAtMs = now
+            lastPlaybackPersistPositionMs = stored.positionMs
+            lastPlaybackPersistUrl = stored.url
+        }
     }
 
     private fun updateCastMessage(message: String) {
@@ -1054,6 +1153,8 @@ fun MovieCastScreen(
     onClearCandidates: () -> Unit,
     onManualCandidate: (String) -> Unit,
     onCastSelected: () -> Unit,
+    onResumeStartOver: () -> Unit,
+    onResumeContinue: () -> Unit,
     onQueueSelected: () -> Unit,
     onPlayPause: () -> Unit,
     onStop: () -> Unit,
@@ -1128,7 +1229,57 @@ fun MovieCastScreen(
             }
             BottomTabs(selectedTab = selectedTab, onSelect = { selectedTab = it })
         }
+        uiState.resumePrompt?.let { prompt ->
+            ResumeCastDialog(
+                prompt = prompt,
+                onStartOver = onResumeStartOver,
+                onContinue = onResumeContinue
+            )
+        }
     }
+}
+
+@Composable
+private fun ResumeCastDialog(
+    prompt: ResumePromptState,
+    onStartOver: () -> Unit,
+    onContinue: () -> Unit
+) {
+    val startMs = PlaybackResumePolicy.startPosition(prompt.position.positionMs, prompt.position.durationMs)
+    val progressText = if (prompt.position.durationMs > 0L) {
+        "${formatMillis(startMs)} / ${formatMillis(prompt.position.durationMs)}"
+    } else {
+        formatMillis(startMs)
+    }
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("Tiếp tục xem?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = prompt.position.title.ifBlank { MediaDetector.safeTitle(prompt.candidate) },
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "Link này đã dừng ở $progressText. Chọn cách phát trước khi gửi video lên TV.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onContinue) {
+                Text("Tiếp tục")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onStartOver) {
+                Text("Phát từ đầu")
+            }
+        }
+    )
 }
 
 @Composable

@@ -10,6 +10,14 @@ data class HistoryEntry(
     val visitedAt: Long
 )
 
+data class PlaybackPositionEntry(
+    val url: String,
+    val title: String,
+    val positionMs: Long,
+    val durationMs: Long,
+    val updatedAt: Long
+)
+
 class HistoryStore(context: Context) {
     private val preferences = context.getSharedPreferences("movie_cast_android_state", Context.MODE_PRIVATE)
 
@@ -36,6 +44,33 @@ class HistoryStore(context: Context) {
         return preferences.getBoolean(KEY_APP_MUTED, false)
     }
 
+    fun playbackPositionFor(url: String): PlaybackPositionEntry? {
+        if (!isHistoryUrl(url)) return null
+        return playbackPositions()
+            .firstOrNull { it.url == url }
+            ?.takeIf { PlaybackResumePolicy.isResumable(it.positionMs, it.durationMs) }
+    }
+
+    fun rememberPlaybackPosition(
+        url: String,
+        title: String,
+        positionMs: Long,
+        durationMs: Long
+    ): PlaybackPositionEntry? {
+        if (!isHistoryUrl(url)) return null
+        if (!PlaybackResumePolicy.isResumable(positionMs, durationMs)) return null
+        val entry = PlaybackPositionEntry(
+            url = url,
+            title = title.ifBlank { MediaDetector.hostForUrl(url) },
+            positionMs = PlaybackResumePolicy.startPosition(positionMs, durationMs),
+            durationMs = durationMs.coerceAtLeast(0L),
+            updatedAt = System.currentTimeMillis()
+        )
+        val next = listOf(entry) + playbackPositions().filterNot { it.url == url }
+        savePlaybackPositions(next.take(PLAYBACK_POSITION_LIMIT))
+        return entry
+    }
+
     fun setAppMuted(muted: Boolean) {
         preferences.edit()
             .putBoolean(KEY_APP_MUTED, muted)
@@ -59,8 +94,29 @@ class HistoryStore(context: Context) {
         preferences.edit()
             .remove(KEY_LAST_PAGE_URL)
             .remove(KEY_HISTORY)
+            .remove(KEY_PLAYBACK_POSITIONS)
             .apply()
         return emptyList()
+    }
+
+    private fun playbackPositions(): List<PlaybackPositionEntry> {
+        val raw = preferences.getString(KEY_PLAYBACK_POSITIONS, "[]") ?: "[]"
+        return runCatching {
+            val array = JSONArray(raw)
+            List(array.length()) { index ->
+                val item = array.getJSONObject(index)
+                PlaybackPositionEntry(
+                    url = item.optString("url"),
+                    title = item.optString("title"),
+                    positionMs = item.optLong("positionMs"),
+                    durationMs = item.optLong("durationMs"),
+                    updatedAt = item.optLong("updatedAt")
+                )
+            }
+                .filter { isHistoryUrl(it.url) }
+                .filter { PlaybackResumePolicy.isResumable(it.positionMs, it.durationMs) }
+                .take(PLAYBACK_POSITION_LIMIT)
+        }.getOrDefault(emptyList())
     }
 
     private fun saveState(lastPageUrl: String, history: List<HistoryEntry>) {
@@ -79,6 +135,23 @@ class HistoryStore(context: Context) {
             .apply()
     }
 
+    private fun savePlaybackPositions(positions: List<PlaybackPositionEntry>) {
+        val array = JSONArray()
+        positions.forEach { item ->
+            array.put(
+                JSONObject()
+                    .put("url", item.url)
+                    .put("title", item.title)
+                    .put("positionMs", item.positionMs)
+                    .put("durationMs", item.durationMs)
+                    .put("updatedAt", item.updatedAt)
+            )
+        }
+        preferences.edit()
+            .putString(KEY_PLAYBACK_POSITIONS, array.toString())
+            .apply()
+    }
+
     private fun isHistoryUrl(url: String): Boolean {
         return url.startsWith("http://", true) || url.startsWith("https://", true)
     }
@@ -87,6 +160,8 @@ class HistoryStore(context: Context) {
         const val KEY_LAST_PAGE_URL = "lastPageUrl"
         const val KEY_HISTORY = "history"
         const val KEY_APP_MUTED = "appMuted"
+        const val KEY_PLAYBACK_POSITIONS = "playbackPositions"
         const val HISTORY_LIMIT = 40
+        const val PLAYBACK_POSITION_LIMIT = 100
     }
 }
